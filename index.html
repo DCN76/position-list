@@ -145,7 +145,9 @@
             <h2 class="text-2xl font-bold text-gray-100 mb-4">Global Vessel Positions</h2>
             <div id="ship-list" class="space-y-3">
                 <!-- Ship rows will be rendered here by JavaScript -->
-                <p class="text-gray-400" id="loading-message">Loading ship data...</p>
+                <p class="text-gray-400" id="loading-message">
+                    <span id="loading-text">Connecting to Database...</span>
+                </p>
             </div>
         </div>
 
@@ -179,17 +181,141 @@
 
                 <!-- Section 2: Data Management -->
                 <div>
-                    <h3 class="text-xl font-semibold text-indigo-400 mb-3 border-b border-gray-700 pb-2">Data Management</h3>
+                    <h3 class="text-xl font-semibold text-indigo-400 mb-3 border-b border-gray-700 pb-2">Data Management (Database Operations)</h3>
                     <p class="text-gray-400 mb-4 text-sm">
-                        Since itinerary edits are saved only in the browser's memory (in-app session), you can reset the data to its original state.
+                        This action will overwrite the current live database data with the original default data set.
                     </p>
                     <button onclick="resetShipData()" class="bg-red-700 text-white px-6 py-3 rounded-lg font-semibold hover:bg-red-600 transition duration-150 shadow-md">
-                        Reset All Itineraries (Restore Defaults)
+                        Reset All Itineraries (Restore Defaults in DB)
                     </button>
                 </div>
             </div>
         </div>
     </div>
+
+    <!-- Firebase SDK Imports (Module type required for ES modules) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Use Debug logging to see detailed Firestore operations
+        setLogLevel('Debug');
+
+        // --- GLOBAL INITIALIZATION ---
+        
+        // Access global environment variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        // Export globally needed variables for non-module script access
+        window.db = db;
+        window.auth = auth;
+        window.appId = appId;
+        window.shipData = []; // Data will be loaded here from Firestore
+        
+        // EXPORT Firestore utilities needed by global functions (saveItinerary, resetShipData)
+        window.doc = doc;
+        window.setDoc = setDoc;
+        window.writeBatch = writeBatch;
+        
+        // --- AUTHENTICATION AND SETUP ---
+
+        /**
+         * Authenticates the user using the provided custom token or anonymously.
+         */
+        async function authenticateUser() {
+            try {
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                // Once authenticated, the auth listener will pick it up and proceed
+            } catch (error) {
+                console.error("Firebase Authentication Error:", error);
+                // FIX: Check if the element exists before trying to set textContent
+                const loadingText = document.getElementById('loading-text');
+                if (loadingText) {
+                    loadingText.textContent = "Authentication Failed. See console for details.";
+                }
+            }
+        }
+        
+        /**
+         * Sets up the real-time data listener once the user is authenticated.
+         */
+        function setupDataListener() {
+            const dataPath = `artifacts/${appId}/public/data/vessels`;
+            const q = collection(db, dataPath);
+
+            // Real-time listener for all vessels
+            onSnapshot(q, (querySnapshot) => {
+                const loadedShips = [];
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    // Ensure the IMO is correctly set from the document ID
+                    data.imo = doc.id; 
+                    loadedShips.push(data);
+                });
+                
+                // Sort by IMO for consistent display
+                window.shipData = loadedShips.sort((a, b) => a.imo.localeCompare(b.imo));
+
+                // Update UI based on loaded data
+                const loadingMessage = document.getElementById('loading-message');
+                if (loadingMessage) {
+                    loadingMessage.classList.add('hidden');
+                }
+                
+                // Only re-render if we are on the position list page
+                if (window.currentPage === 'position-list') {
+                    // Use the globally exposed render function
+                    window.renderShipList(window.lastOpenImo);
+                }
+            }, (error) => {
+                console.error("Firestore Snapshot Listener Error:", error);
+                // FIX: Check if the element exists before trying to set textContent
+                const loadingText = document.getElementById('loading-text');
+                if (loadingText) {
+                    loadingText.textContent = "Failed to load data from Firestore.";
+                }
+                const loadingMessage = document.getElementById('loading-message');
+                if (loadingMessage) {
+                    loadingMessage.classList.remove('hidden');
+                }
+            });
+        }
+
+        // Auth State Listener: Start data listeners only after auth is ready
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                console.log("User authenticated:", user.uid);
+                window.userId = user.uid;
+                // FIX: Check if the element exists before trying to set textContent
+                const loadingText = document.getElementById('loading-text');
+                if (loadingText) {
+                    loadingText.textContent = "Loading vessel data...";
+                }
+                setupDataListener();
+            } else {
+                // User logged out or initial state check complete
+            }
+        });
+
+        // Start the authentication process
+        authenticateUser();
+        
+    </script>
+
 
     <script>
         // --- CONSTANTS AND STATE ---
@@ -199,10 +325,11 @@
         window.currentEditKey = LOCAL_EDIT_KEY_DEFAULT;
 
         // Tracks unlocked state per ship IMO (in-memory, non-persistent)
-        const unlockedShips = {}; 
+        window.unlockedShips = {}; 
+        window.lastOpenImo = null; // Track the last opened IMO to re-open it on re-render
         
-        // --- SHIP DATA ---
-        let shipData = [
+        // Original default data (used for database reset)
+        const originalShipData = [
             {
                 name: "MSC Gaia",
                 imo: "9832721",
@@ -269,12 +396,10 @@
                 ]
             }
         ];
-        // Create a deep copy of the original data to allow resetting
-        const originalShipData = JSON.parse(JSON.stringify(shipData));
 
 
         // --- CORE FUNCTIONS ---
-
+        
         /**
          * Attempts to unlock the itinerary for a given ship IMO using the current key.
          * @param {string} imo - The IMO number of the ship.
@@ -285,13 +410,13 @@
             const messageElement = document.getElementById(`password-message-edit-${imo}`);
             
             if (inputField.value === currentKey) {
-                unlockedShips[imo] = true;
+                window.unlockedShips[imo] = true;
                 messageElement.textContent = 'Unlocked! Itinerary is now editable.';
                 messageElement.className = 'text-green-400 font-semibold';
                 
                 // Pass the IMO to renderShipList so it knows to keep this row open.
                 // Re-render the list to switch from view-only content to input fields
-                setTimeout(() => renderShipList(imo), 300); 
+                setTimeout(() => window.renderShipList(imo), 300); 
 
             } else {
                 messageElement.textContent = `Incorrect key. The current key is "${currentKey}".`;
@@ -301,14 +426,19 @@
         }
 
         /**
-         * Gathers the data from the editable fields and updates the global shipData array.
-         * NOTE: This is an in-memory update only and will be lost on page refresh.
+         * Gathers the data from the editable fields and UPDATES THE FIRESTORE DOCUMENT.
          * @param {string} imo - The IMO number of the ship being saved.
          */
-        function saveItinerary(imo) {
-            const shipIndex = shipData.findIndex(s => s.imo === imo);
+        async function saveItinerary(imo) {
+            if (!window.db || !window.appId || !window.doc || !window.setDoc) {
+                window.alertUser('error', 'Database connection not ready.');
+                return;
+            }
+            
+            const shipIndex = window.shipData.findIndex(s => s.imo === imo);
             if (shipIndex === -1) return;
 
+            const shipName = window.shipData[shipIndex].name;
             const updatedItinerary = [];
             const fields = ['port', 'eta', 'etd', 'agent', 'comments'];
 
@@ -326,17 +456,29 @@
                 updatedItinerary.push(newStop);
             });
 
-            shipData[shipIndex].itinerary = updatedItinerary;
-            alertUser('success', `Itinerary for ${shipData[shipIndex].name} saved successfully! (In-memory update only)`);
-            
-            // Lock the editing mode after saving (optional, but safer)
-            delete unlockedShips[imo];
-            
-            // Re-render the list content and keep this row open to show the new view-only data
-            renderShipList(imo);
-            
-            // Re-apply navigation styling to confirm the current page is still active
-            updateNavStyling(window.currentPage);
+            // Prepare the data structure for Firestore update
+            const updatedShipData = {
+                itinerary: updatedItinerary,
+                lastUpdated: new Date().toISOString()
+            };
+
+            try {
+                const { db, appId } = window;
+                // Use globally exposed doc and setDoc
+                const docRef = window.doc(db, `artifacts/${appId}/public/data/vessels`, imo);
+                
+                await window.setDoc(docRef, updatedShipData, { merge: true });
+                
+                window.alertUser('success', `Itinerary for ${shipName} saved successfully to the database!`);
+                
+                // Lock the editing mode after saving
+                delete window.unlockedShips[imo];
+                
+                // The onSnapshot listener will automatically trigger renderShipList()
+            } catch (error) {
+                console.error("Error saving itinerary to Firestore:", error);
+                window.alertUser('error', `Failed to save changes for ${shipName}. See console.`);
+            }
         }
 
         /**
@@ -344,7 +486,7 @@
          * @param {string} type - 'success' or 'error'
          * @param {string} message - The message to display
          */
-        function alertUser(type, message) {
+        window.alertUser = function(type, message) {
             let messageBox = document.getElementById('status-message-box');
 
             if (!messageBox) {
@@ -377,10 +519,10 @@
 
             // --- 1. Control Panel (Unlock/Save) ---
             if (isUnlocked) {
-                // RENDER ONLY THE MESSAGE AND HR (Removed the top Save button)
+                // RENDER ONLY THE MESSAGE AND HR
                 itineraryDiv.innerHTML += `
                     <p class="text-sm text-green-400 font-semibold mb-3">
-                        Editing Mode Unlocked. (Data is in-memory and will be lost on refresh.)
+                        Editing Mode Unlocked.
                     </p>
                     <hr class="my-4 border-gray-600"> <!-- Darker HR -->
                 `;
@@ -429,12 +571,15 @@
             
             // Table Body (View or Editable Content)
             const tbody = document.createElement('tbody');
-            ship.itinerary.forEach((item, index) => {
+            // Ensure itinerary is an array before trying to iterate
+            const itinerary = Array.isArray(ship.itinerary) ? ship.itinerary : [];
+            itinerary.forEach((item, index) => {
                 const row = document.createElement('tr');
                 const fields = ['port', 'eta', 'etd', 'agent', 'comments'];
 
                 row.innerHTML = fields.map(field => {
-                    const value = item[field];
+                    // Use a fallback for null/undefined values
+                    const value = item[field] || ''; 
                     if (isUnlocked) {
                         return `
                             <td data-label="${field.toUpperCase()}">
@@ -462,7 +607,7 @@
                 const saveButtonBottom = document.createElement('button');
                 saveButtonBottom.onclick = () => saveItinerary(ship.imo);
                 saveButtonBottom.className = 'w-full md:w-auto mt-4 px-6 py-3 bg-green-600 text-white font-bold rounded-lg shadow-md hover:bg-green-700 transition duration-150';
-                saveButtonBottom.textContent = 'Save Changes (Local)';
+                saveButtonBottom.textContent = 'Save Changes (To Database)';
                 itineraryDiv.appendChild(saveButtonBottom);
             }
 
@@ -471,14 +616,21 @@
 
         /**
          * Renders the main ship list and the collapsible itineraries.
+         * Exposed globally as it's called by the onSnapshot listener.
          * @param {string | null} imoToKeepOpen - The IMO of the ship whose details should remain open.
          */
-        function renderShipList(imoToKeepOpen = null) {
+        window.renderShipList = function(imoToKeepOpen = null) {
             const listContainer = document.getElementById('ship-list');
             listContainer.innerHTML = ''; // Clear content
+            window.lastOpenImo = imoToKeepOpen; // Remember the last one that was intentionally open
 
-            shipData.forEach(ship => {
-                const isUnlocked = unlockedShips[ship.imo];
+            if (window.shipData.length === 0) {
+                listContainer.innerHTML = '<p class="text-gray-400">No vessel data loaded or found in the database.</p>';
+                return;
+            }
+
+            window.shipData.forEach(ship => {
+                const isUnlocked = window.unlockedShips[ship.imo];
                 const statusColor = ship.status.includes('At Sea') ? 'bg-blue-900/50 text-blue-300' :
                                     ship.status.includes('Port Stay') ? 'bg-green-900/50 text-green-300' :
                                     'bg-yellow-900/50 text-yellow-300';
@@ -491,6 +643,17 @@
                 if (ship.imo === imoToKeepOpen) {
                     details.open = true;
                 }
+                
+                // Add event listener to capture when a row is manually closed/opened
+                details.addEventListener('toggle', () => {
+                    if (details.open) {
+                        window.lastOpenImo = ship.imo;
+                    } else if (window.lastOpenImo === ship.imo) {
+                        // Clear the tracked IMO if the user closes it manually
+                        window.lastOpenImo = null;
+                    }
+                });
+
 
                 // --- 2. Create the Summary (Ship Header) ---
                 const summary = document.createElement('summary');
@@ -521,7 +684,7 @@
                 // --- 3. Create the Itinerary Content (View-only by default) ---
                 const itineraryContent = renderItineraryContent(ship, isUnlocked);
                 
-                // --- 4. Assemble the final structure ---\
+                // --- 4. Assemble the final structure ---
                 details.appendChild(summary);
                 details.appendChild(itineraryContent);
                 listContainer.appendChild(details);
@@ -548,26 +711,46 @@
             }
         }
         
-        // Function to reset all ship data to the initial state
-        function resetShipData() {
-            // Reset shipData to the deep copy of the original data
-            shipData = JSON.parse(JSON.stringify(originalShipData));
-            // Clear any unlocks
-            Object.keys(unlockedShips).forEach(key => delete unlockedShips[key]);
-            alertUser('success', 'All ship data reset to default and editing locks cleared.');
-            
-            // Re-render the list if we are on the position list page
-            if (window.currentPage === 'position-list') {
-                renderShipList();
+        /**
+         * Function to reset all ship data to the initial state in the database.
+         * It uses a Firestore batch write for efficiency.
+         */
+        async function resetShipData() {
+            // Ensure all necessary globals are available
+            if (!window.db || !window.appId || !window.doc || !window.writeBatch) {
+                window.alertUser('error', 'Database connection not fully ready. Try again in a moment.');
+                return;
             }
-            
-            // Ensure the active tab remains highlighted regardless of the view
-            updateNavStyling(window.currentPage);
+
+            try {
+                const { db, appId } = window;
+                // Use the globally exposed writeBatch function
+                const batch = window.writeBatch(db);
+                const dataPath = `artifacts/${appId}/public/data/vessels`;
+
+                originalShipData.forEach(ship => {
+                    // Use the globally exposed doc function
+                    const docRef = window.doc(db, dataPath, ship.imo);
+                    // Add the entire ship object to the batch
+                    batch.set(docRef, ship);
+                });
+
+                await batch.commit();
+
+                // Clear any in-memory unlocks
+                Object.keys(window.unlockedShips).forEach(key => delete window.unlockedShips[key]);
+                window.alertUser('success', 'All ship data reset to default and saved to database!');
+                
+                // The onSnapshot listener will handle the UI update automatically
+            } catch (error) {
+                console.error("Error resetting ship data:", error);
+                window.alertUser('error', 'Failed to reset data in the database.');
+            }
         }
 
 
         /**
-         * (REFACTORED) Updates the navigation tabs to highlight the active page.
+         * Updates the navigation tabs to highlight the active page.
          * @param {string} pageName - The page to highlight ('position-list' or 'settings').
          */
         function updateNavStyling(pageName) {
@@ -587,13 +770,12 @@
 
 
         /**
-         * (REFACTORED) Switches the active view/page (Position List or Settings).
+         * Switches the active view/page (Position List or Settings).
          * @param {string} pageName - 'position-list' or 'settings'.
          */
         function switchView(pageName) {
             // Check if we are already on this page
             if (window.currentPage === pageName) {
-                // If we are, just make sure the nav styling is correct (e.g., after a reload/action)
                 updateNavStyling(pageName);
                 return; 
             }
@@ -608,8 +790,8 @@
             if (pageName === 'position-list') {
                 positionView.classList.remove('hidden');
                 settingsView.classList.add('hidden');
-                // Render list content only when activating this view
-                renderShipList(); 
+                // Call renderShipList to display current database data
+                window.renderShipList(window.lastOpenImo); 
             } else {
                 positionView.classList.add('hidden');
                 settingsView.classList.remove('hidden');
@@ -624,7 +806,7 @@
         // Run the rendering function when the window loads
         window.onload = function() {
             // Start the application on the 'position-list' view
-            // This also initializes window.currentPage and sets the initial nav bar highlight
+            // The Firebase setup handles the data loading
             switchView('position-list'); 
         }
     </script>
